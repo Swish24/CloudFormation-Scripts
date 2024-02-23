@@ -1,0 +1,325 @@
+Parameters:
+  WebhookType:
+    Type: String
+    Default: Discord
+    AllowedValues:
+      - Discord
+      - Slack
+      - Custom
+    Description: Enter Discord, Slack or custom webhook endpoint
+    AllowedPattern: ^[a-zA-Z0-9]*$
+    MinLength: 1
+  WebhookUrl: 
+    Type: String
+    Description: Enter Discord, Slack or custom webhook url to send the notification
+    AllowedPattern: ^https://.*$
+    MinLength: 1
+  S3BucketName: 
+    Type: String
+    Description: Enter name for S3 bucket
+    AllowedPattern: ^[a-zA-Z0-9]*$
+    MinLength: 1
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+      Path: /
+      Description: "Lambda role for sqs notifications"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies: 
+        - PolicyName: lambda-s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                - 'sqs:ReceiveMessage'
+                - 'sqs:DeleteMessage'
+                - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt SQSQue.Arn
+      RoleName: "Lambda-sqs-role"
+    DependsOn: SQSQue
+  SNSLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - sns.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+      Path: /
+      Description: "SNS Logging Role"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSNSRole"
+      RoleName: "SNSLoggingRole"
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "S3-events"
+      TopicName: "s3-events"
+      DeliveryStatusLogging:
+       - Protocol: sqs
+         SuccessFeedbackSampleRate: 45
+         SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+         FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+       - Protocol: lambda
+         SuccessFeedbackSampleRate: 45
+         SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+         FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties: 
+      Topics:
+       - !Ref SNSTopic
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sns:Publish'
+            Effect: Allow
+            Resource: !Ref SNSTopic
+            Principal: 
+              Service: "s3.amazonaws.com"
+            Condition:
+              ArnEquals:
+                "aws:SourceArn":
+                - Fn::Join:
+                  - ""
+                  - - "arn:"
+                    - !Ref AWS::Partition
+                    - ":s3:::"
+                    - !Ref S3BucketName
+  SQSQue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "s3-events"
+      VisibilityTimeout: 15
+  SQSQuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sqs:SendMessage'
+            Principal: '*'
+            Effect: Allow
+            Resource: !GetAtt SQSQue.Arn
+            Condition:
+              ArnEquals:
+               "aws:SourceArn": !Ref SNSTopic
+      Queues:
+        - !Ref SQSQue
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt SQSQue.Arn
+      Protocol: "sqs"
+      TopicArn: !Ref SNSTopic
+      RawMessageDelivery: 'true'
+  SQSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.10
+      Architectures: 
+      - x86_64
+      Code:
+       ZipFile: |
+        import json
+        import urllib3
+        import os
+        from datetime import datetime
+
+        print(os.environ['webhookType'])
+        site = os.environ['webhookType']
+
+        print(os.environ['webhookUrl'])
+        webhookUrl = os.environ['webhookUrl']
+        http = urllib3.PoolManager()
+
+
+        # Create our discord alert function
+        def sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName):
+            eventTime_str = datetime.strptime(eventTime, "%Y-%m-%dT%H:%M:%S.%fZ")
+            unix_timestamp = int(eventTime_str.timestamp())
+            if site == 'Slack':
+              webhook = webhookUrl
+              embedData = {
+            "attachments": [
+                {
+                    "color": color,
+                    "title": eventName,
+                    "fields": [
+                        {
+                            "title": "Bucket Name",
+                            "value": s3BucketName,
+                            "short": "false"
+                        },
+                        {
+                            "title": "Object Name",
+                            "value": objectName,
+                            "short": "false"
+                        },
+                        {
+                            "title": "IP Address",
+                            "value": sourceIPAddress,
+                            "short": "false"
+                        },
+                        {
+                            "title": "timestamp",
+                            "value": eventTime,
+                            "short": "false"
+                    },
+                    ],
+                }
+            ]
+        }
+              json_payload = json.dumps(embedData).encode('utf-8')
+            elif site == 'Discord':
+              webhook = webhookUrl
+              embedData = {
+                  "title": eventName,
+                  "color": color,
+                  "fields": [
+                      {
+                          "name": "Event Time",
+                          "value": f"<t:{unix_timestamp}>",
+                      },
+                      {
+                          "name": "IP Address",
+                          "value": sourceIPAddress,
+                      },
+                      {
+                          "name" : "Bucket Name",
+                          "value": s3BucketName,
+                      },
+                      {
+                          "name": "Object Name",
+                          "value": objectName,
+                      },
+                  ],
+                  "footer": {
+                      "text": "Lambda S3 Monitor"
+                  },
+                  "timestamp": eventTime
+              }
+              json_payload = json.dumps({'embeds': [embedData]}).encode('utf-8')
+            elif site == 'Custom':
+              webhook = webhookUrl
+              embedData = {
+                  "EventName": eventName,
+                  "EventTime": eventTime,
+                  "IPAddress": sourceIPAddress,
+                  "BucketName": s3BucketName,
+                  "ObjectName": objectName,
+                  "color": color
+                  }
+              json_payload = json.dumps(embedData).encode('utf-8') 
+            req = http.request(
+              'POST',
+              webhook,
+              body=json_payload,
+              headers={'Content-Type': 'application/json'} 
+            )
+          # Check response of the POST request to discord, 204 is expected per the Discord docs, 4xx, 5xx is a failure
+            if req.status == 200 or 204:
+              return True
+            elif req.status == 400:
+              return False
+            
+        def lambda_handler(event, context):
+
+          record = (event['Records'][0]['body'])
+          # Parse the Event data to JSON, so we can pass it through to our alert function
+          parsed = json.loads(record)
+
+          if 'Event' not in parsed:
+            eventName = (parsed['Records'][0]['eventName'])
+            eventTime = (parsed['Records'][0]['eventTime'])
+            sourceIPAddress = (parsed['Records'][0]['requestParameters']['sourceIPAddress'])
+            s3BucketName = (parsed['Records'][0]['s3']['bucket']['name'])
+            objectName = (parsed['Records'][0]['s3']['object']['key'])
+            # print(eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+            # Check for whnich event occured, this will allow us to put specific colors on our webhook to Discord/Slack
+            def event_name(site, eventName, eventTime, sourceIPAddress, s3BucketName, objectName):
+              match eventName:
+                case 'ObjectCreated:Put':
+                      if site == 'Slack':
+                        color = '#1ABC9C'
+                        alert = sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+                      elif site =='Discord':
+                        color = 1752220
+                        alert = sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+                      elif site =='Custom':
+                        color = '#1ABC9C'
+                        alert = sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+                      if alert:
+                          return True
+                      else:
+                          return False
+                case 'ObjectRemoved:Delete':
+                      if site == 'Slack':
+                        color = '#992D22'
+                        alert = sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+                      elif site =='Discord':
+                        color = 10038562
+                        alert = sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+                      elif site =='Custom':
+                        color = '#992D22'
+                        alert = sendAlert(site, color, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+                      if alert:
+                          return True
+                      else:
+                          return False
+                case _:
+                      return "Unrecognized event received"
+
+            request = event_name(site, eventName, eventTime, sourceIPAddress, s3BucketName, objectName)
+          #Return success or failure from lambda Response, this will tell the SQS queue to stop on success or try again on failure
+            if request:
+              return True
+            else: 
+              return False
+          else:
+            print('SQS Test Message received, ignoring')
+      Description: "Lambda to process sqs events"
+      Environment:
+        Variables:
+          webhookType: !Ref WebhookType
+          webhookUrl: !Ref WebhookUrl
+      FunctionName: "s3-sns-alerts"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+  SQSEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: "true"
+      EventSourceArn: !GetAtt SQSQue.Arn
+      FunctionName: !GetAtt SQSLambda.Arn
+    DependsOn: SQSLambda
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref SNSTopic
+            Event: 's3:ObjectCreated:*'
+          - Topic: !Ref SNSTopic
+            Event: 's3:ObjectRemoved:*'
+    DependsOn: SNSTopicPolicy
